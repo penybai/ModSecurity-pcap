@@ -1,8 +1,10 @@
 #include <modsecurity/modsecurity.h>
+#include <modsecurity/rules_set.h>
 #include <pcap.h>
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <string.h>
 
 // Structs for processing
 #include <netinet/ether.h>
@@ -16,12 +18,9 @@
 
 #include "pcap.h"
 
-
 #ifndef ETHERTYPE_IP6
     #define ETHERTYPE_IP6 0x86dd
 #endif
-
-
 
 // Our constructor that collects the packet header and data
 Packet::Packet(pcap_pkthdr *header, const u_char *data, int verbose)
@@ -322,7 +321,7 @@ class ModSecurityAnalyzer
         int AddRequestInfo(Packet *mypacket);
         int AddResponseInfo(Packet *mypacket);
         int RunPhases();
-        int RunAssayCleanup();
+        int RunTransactionCleanup();
         int RunCleanup();
     private:
         int _testIntervention(modsecurity::ModSecurityIntervention status_it);
@@ -330,10 +329,10 @@ class ModSecurityAnalyzer
         modsecurity::ModSecurity *_modsec;
       
        // modsecurity rules
-       modsecurity::Rules *_rules;
+       modsecurity::RulesSet *_rules;
  
        // modsecurity transaction object
-       modsecurity::Assay *_pmodsecAssay;
+       modsecurity::Transaction *_transaction;
 };
 
 ModSecurityAnalyzer::ModSecurityAnalyzer(std::string main_rule_uri){
@@ -353,11 +352,10 @@ ModSecurityAnalyzer::ModSecurityAnalyzer(std::string main_rule_uri){
 
 
 int ModSecurityAnalyzer::AddConnectionInfo(std::string src,int srcprt,std::string dst,int dstprt){
-    _pmodsecAssay = modsecurity::msc_new_assay(_modsec, _rules, NULL);
+    _transaction = msc_new_transaction(_modsec, _rules, NULL);
     // Assign the IP's and ports to the transaction
-    _pmodsecAssay->processConnection(src.c_str(), srcprt, dst.c_str(), dstprt);
+    _transaction->processConnection(src.c_str(), srcprt, dst.c_str(), dstprt);
     return 1;       
-
 }
 
 int ModSecurityAnalyzer::AddRequestInfo(Packet *mypacket){
@@ -370,16 +368,16 @@ int ModSecurityAnalyzer::AddRequestInfo(Packet *mypacket){
 
     // ModSecurity wants the HTTP/ removed from the 1.1
     version = version.substr(5,version.length()-5);
-    _pmodsecAssay->processURI(uri.c_str(),method.c_str(),version.c_str());
+    _transaction->processURI(uri.c_str(),method.c_str(),version.c_str());
 
     // Add each header key/value to as a header in modsec
     for(std::vector<std::string>::size_type header = 0; header != headerNames.size(); header++) {
-      _pmodsecAssay->addRequestHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
+      _transaction->addRequestHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
     }
 
     // Add the body data only if it has a body
     if(bodyData != "" ){
-        _pmodsecAssay->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
+        _transaction->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
     }
     return 1;
 }
@@ -393,12 +391,12 @@ int ModSecurityAnalyzer::AddResponseInfo(Packet *mypacket){
 
     // Add each response header as a header in modsec
     for(std::vector<std::string>::size_type header = 0; header != headerNames.size(); header++) {
-      _pmodsecAssay->addResponseHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
+      _transaction->addResponseHeader(reinterpret_cast<const unsigned char*>(headerNames[header].c_str()),reinterpret_cast<const unsigned char*>(headerValues[header].c_str()));
     }
     
     // Add the body if there is one
     if(bodyData != "" ){
-        _pmodsecAssay->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
+        _transaction->appendRequestBody(reinterpret_cast<const unsigned char*>(bodyData.c_str()),bodyData.length());
     }
 
 }
@@ -406,7 +404,7 @@ int ModSecurityAnalyzer::AddResponseInfo(Packet *mypacket){
 // Testing for interventions is needed but we can't deny anyway, we're out of line
 // If needed a TCP reset packet could be sent here to try and emulate inline-ness
 int ModSecurityAnalyzer::_testIntervention(modsecurity::ModSecurityIntervention status_it){
-    _pmodsecAssay->intervention(&status_it);
+    _transaction->intervention(&status_it);
     if( status_it.disruptive == 1)
     {
         std::cout << "There was a disruptive action but we are out of line" << std::endl;
@@ -425,24 +423,24 @@ int ModSecurityAnalyzer::_testIntervention(modsecurity::ModSecurityIntervention 
 // our packet
 int ModSecurityAnalyzer::RunPhases(){
     modsecurity::ModSecurityIntervention status_it;
-    _pmodsecAssay->processRequestHeaders();
+    _transaction->processRequestHeaders();
     _testIntervention(status_it);
-    _pmodsecAssay->processRequestBody();
+    _transaction->processRequestBody();
     _testIntervention(status_it);
-    _pmodsecAssay->processResponseHeaders();
+    _transaction->processResponseHeaders(200, "HTTP 1.1");
     _testIntervention(status_it);
-    _pmodsecAssay->processResponseBody();
+    _transaction->processResponseBody();
     _testIntervention(status_it);
-    _pmodsecAssay->processLogging(200);
+    _transaction->processLogging();
     _testIntervention(status_it);
     return 1;
 }
-int ModSecurityAnalyzer::RunAssayCleanup(){
-    delete _pmodsecAssay;
+int ModSecurityAnalyzer::RunTransactionCleanup(){
+    msc_transaction_cleanup(_transaction);
 }
 int ModSecurityAnalyzer::RunCleanup(){
-    delete _rules;
-    delete _modsec;
+    msc_rules_cleanup(_rules);
+    msc_cleanup(_modsec);
 }
 
  
@@ -580,7 +578,7 @@ int main(int argc, char* argv[])
         // We won't need our packet for this tool
         delete mypacket;
         // TODO: cleaning up the assay results in a segfault?
-        //msa->RunAssayCleanup();
+        //msa->RunTransactionCleanup();
     }
     // Cleansup our modsec objects
     msa->RunCleanup();
